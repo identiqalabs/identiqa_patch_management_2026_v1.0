@@ -1,0 +1,29 @@
+---
+- name: Linux patch assessment
+  hosts: linux
+  gather_facts: false
+
+  tasks:
+    - name: Get Linux hostname
+      ansible.builtin.command: hostname
+      register: linux_hostname
+      changed_when: false
+
+    - name: Discover pending Ubuntu updates
+      ansible.builtin.command: apt list --upgradable
+      register: linux_updates
+      changed_when: false
+
+    - name: Display assessment
+      ansible.builtin.debug:
+        msg:
+          hostname: "{{ linux_hostname.stdout | trim }}"
+          server: "{{ ansible_host | default(inventory_hostname) }}"
+          pending_updates: "{{ linux_updates.stdout_lines }}"
+
+    - name: Publish Linux discovery evidence
+      ansible.builtin.set_stats:
+        data:
+          discovered_linux_hostname: "{{ linux_hostname.stdout | trim }}"
+          discovered_linux_host_ip: "{{ ansible_host | default(inventory_hostname) }}"
+        per_host: false

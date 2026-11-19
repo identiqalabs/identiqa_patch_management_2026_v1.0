@@ -1,0 +1,97 @@
+
+---
+- name: Windows VMware snapshot cleanup - dry run
+  hosts: windows
+  gather_facts: false
+  serial: 1
+
+  vars:
+    protected_host: "192.168.156.133"
+    vmware_host: "172.17.99.161"
+    vmware_user: "shivamgargidentiqal"
+
+    expected_patch_cycle_id: >-
+      {{
+        tower_workflow_job_id
+        | default(awx_workflow_job_id | default('unknown'), true)
+        | string
+      }}
+
+    ssh_key: >-
+      {{
+        ansible_ssh_private_key_file
+        | default(lookup('env', 'ANSIBLE_PRIVATE_KEY_FILE'), true)
+      }}
+
+  tasks:
+    - name: Validate Windows target and workflow
+      ansible.builtin.assert:
+        that:
+          - (ansible_host | default(inventory_hostname)) == protected_host
+          - expected_patch_cycle_id != 'unknown'
+        fail_msg: "Cleanup blocked: invalid target or missing workflow ID."
+
+    - name: Validate snapshot and patch installation evidence
+      ansible.builtin.assert:
+        that:
+          - snapshot_verified | default(false) | bool
+          - verified_snapshot_host | default('') == protected_host
+          - verified_patch_cycle_id | default('') == expected_patch_cycle_id
+          - verified_snapshot_name | default('') is match('^Windows-[A-Za-z0-9-]+-[0-9]{8}-[0-9]{6}-IST$')
+          - patch_report is defined
+          - patch_report.status | default('') == 'SUCCESS'
+          - patch_report.remaining_updates | default(-1) | int == 0
+          - patch_report.patch_cycle_id | default('') == expected_patch_cycle_id
+          - patch_report.snapshot_name | default('') == verified_snapshot_name
+          - patch_report.server | default('') == inventory_hostname
+        fail_msg: "Cleanup blocked: snapshot or patch verification evidence missing or mismatched."
+
+    - name: Create SSH directory
+      ansible.builtin.file:
+        path: "{{ lookup('env', 'HOME') }}/.ssh"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+
+    - name: Configure trusted VMware SSH host key
+      ansible.builtin.known_hosts:
+        name: "{{ vmware_host }}"
+        key: "172.17.99.161 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIETRERsyEManulS8o189e43pHlSYNs1qpmg3abqePyvt"
+      delegate_to: localhost
+
+    - name: Execute Windows snapshot cleanup dry run
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - StrictHostKeyChecking=yes
+          - -i
+          - "{{ ssh_key }}"
+          - "{{ vmware_user }}@{{ vmware_host }}"
+          - "windows-cleanup {{ expected_patch_cycle_id }} {{ verified_snapshot_name }}"
+      delegate_to: localhost
+      register: cleanup_result
+      changed_when: false
+
+    - name: Verify cleanup was dry run only
+      ansible.builtin.assert:
+        that:
+          - "'DRY RUN: No snapshots will be deleted' in cleanup_result.stdout"
+          - "('Preserving current snapshot: ' ~ verified_snapshot_name) in cleanup_result.stdout"
+        fail_msg: "Windows cleanup dry-run verification failed."
+
+    - name: Display cleanup results
+      ansible.builtin.debug:
+        msg: "{{ cleanup_result.stdout_lines }}"
+
+    - name: Publish cleanup audit result
+      ansible.builtin.set_stats:
+        data:
+          windows_cleanup:
+            patch_cycle_id: "{{ expected_patch_cycle_id }}"
+            snapshot_name: "{{ verified_snapshot_name }}"
+            status: "DRY_RUN_SUCCESS"
+            deletion_performed: false
+        per_host: false

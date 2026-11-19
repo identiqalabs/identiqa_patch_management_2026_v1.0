@@ -1,0 +1,7 @@
+---
+- name: Test Windows connection from AWX
+  hosts: windows
+  gather_facts: false
+  tasks:
+    - name: Test WinRM authentication
+      ansible.windows.win_ping:

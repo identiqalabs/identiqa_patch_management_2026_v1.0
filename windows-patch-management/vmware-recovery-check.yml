@@ -1,0 +1,51 @@
+---
+- name: Verify VMware recovery point after patch failure
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    snapshot_name: "AWX-PrePatch-20261107-092419"
+    vmware_host: "172.17.99.161"
+    vmware_user: "shivamgargidentiqal"
+    ssh_key: "{{ ansible_ssh_private_key_file | default(lookup('env', 'ANSIBLE_PRIVATE_KEY_FILE'), true) }}"
+
+  tasks:
+    - name: Create SSH directory
+      ansible.builtin.file:
+        path: "{{ lookup('env', 'HOME') }}/.ssh"
+        state: directory
+        mode: "0700"
+
+    - name: Configure trusted SSH host key
+      ansible.builtin.known_hosts:
+        name: "{{ vmware_host }}"
+        key: "172.17.99.161 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIETRERsyEManulS8o189e43pHlSYNs1qpmg3abqePyvt"
+
+    - name: Verify existing recovery snapshot
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - StrictHostKeyChecking=yes
+          - -i
+          - "{{ ssh_key }}"
+          - "{{ vmware_user }}@{{ vmware_host }}"
+          - "recovery-check {{ snapshot_name }}"
+      register: recovery_result
+      changed_when: false
+
+    - name: Confirm recovery point exists
+      ansible.builtin.assert:
+        that:
+          - "'RECOVERY READY:' in recovery_result.stdout"
+        fail_msg: "Recovery point unavailable. Manual investigation required."
+
+    - name: Display recovery status
+      ansible.builtin.debug:
+        msg:
+          - "{{ recovery_result.stdout }}"
+          - "Patch failure detected. Recovery point available."
+          - "Administrator approval required before restoration."

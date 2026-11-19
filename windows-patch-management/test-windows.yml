@@ -1,0 +1,16 @@
+
+---
+- name: Test Windows connectivity from AWX
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+    - name: Ping Windows server through WinRM
+      ansible.windows.win_ping:
+      register: ping_result
+
+    - name: Display connectivity result
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          status: "{{ ping_result.ping }}"

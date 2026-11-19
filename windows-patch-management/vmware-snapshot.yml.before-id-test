@@ -1,0 +1,83 @@
+---
+- name: VMware pre-patch snapshot automation
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    patch_cycle_id: "{{ tower_workflow_job_id | default(awx_workflow_job_id | default(None, true), true) }}"
+    snapshot_name: "AWX-PrePatch-{{ patch_cycle_id }}"
+    vmware_host: "172.17.99.161"
+    vmware_user: "shivamgargidentiqal"
+    ssh_key: "{{ ansible_ssh_private_key_file | default(lookup('env', 'ANSIBLE_PRIVATE_KEY_FILE'), true) }}"
+
+  tasks:
+    - name: Validate workflow patch cycle ID
+      ansible.builtin.assert:
+        that:
+          - patch_cycle_id | string | length > 0
+        success_msg: "Workflow patch cycle ID: {{ patch_cycle_id }}"
+        fail_msg: "AWX workflow ID is missing. Snapshot creation blocked."
+
+    - name: Create SSH directory
+      ansible.builtin.file:
+        path: "{{ lookup('env', 'HOME') }}/.ssh"
+        state: directory
+        mode: "0700"
+
+    - name: Configure trusted SSH host key
+      ansible.builtin.known_hosts:
+        name: "{{ vmware_host }}"
+        key: "172.17.99.161 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIETRERsyEManulS8o189e43pHlSYNs1qpmg3abqePyvt"
+
+    - name: Create or reuse pre-patch snapshot
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - StrictHostKeyChecking=yes
+          - -i
+          - "{{ ssh_key }}"
+          - "{{ vmware_user }}@{{ vmware_host }}"
+          - "create {{ patch_cycle_id }}"
+      register: snapshot_result
+      changed_when: "'CREATED:' in snapshot_result.stdout"
+
+    - name: Verify pre-patch snapshot
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - StrictHostKeyChecking=yes
+          - -i
+          - "{{ ssh_key }}"
+          - "{{ vmware_user }}@{{ vmware_host }}"
+          - "verify {{ snapshot_name }}"
+      register: verification_result
+      changed_when: false
+
+    - name: Display snapshot results
+      ansible.builtin.debug:
+        msg:
+          - "{{ snapshot_result.stdout }}"
+          - "{{ verification_result.stdout }}"
+
+    - name: Confirm snapshot readiness
+      ansible.builtin.assert:
+        that:
+          - "'Snapshot verified:' in verification_result.stdout"
+        success_msg: "Pre-patch snapshot verified. Ready for patching."
+        fail_msg: "Snapshot verification failed. Patching must not proceed."
+
+    - name: Publish verified snapshot details to AWX workflow
+      ansible.builtin.set_stats:
+        data:
+          snapshot_verified: true
+          verified_snapshot_name: "{{ snapshot_name }}"
+          verified_snapshot_host: "192.168.156.133"
+          verified_patch_cycle_id: "{{ patch_cycle_id }}"
+        per_host: false

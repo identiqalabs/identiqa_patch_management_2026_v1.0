@@ -1,0 +1,14 @@
+---
+- name: Validate AWX workflow snapshot evidence
+  hosts: windows
+  gather_facts: false
+  tasks:
+    - name: Check received evidence
+      ansible.builtin.assert:
+        that:
+          - verified_snapshots is defined
+          - inventory_hostname in (verified_snapshots | default({}))
+          - (verified_snapshots | default({})).get(inventory_hostname, {}).get('verified', false) | bool
+          - (verified_snapshots | default({})).get(inventory_hostname, {}).get('vm_id', '') == patch_vm_id
+        fail_msg: "AWX workflow evidence missing or mismatched."
+        success_msg: "AWX received matching snapshot evidence for this server."

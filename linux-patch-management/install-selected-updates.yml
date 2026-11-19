@@ -1,0 +1,208 @@
+---
+- name: Prepare Linux SSH credentials
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars_files:
+    - linux_credentials.yml
+
+  tasks:
+    - name: Create temporary SSH key directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: awx-linux-install-keys-
+      register: linux_key_directory
+
+    - name: Write SSH private keys from Vault
+      ansible.builtin.copy:
+        content: "{{ linux_vm_credentials[item].ssh_private_key | trim }}\n"
+        dest: "{{ linux_key_directory.path }}/{{ item }}.pem"
+        mode: "0600"
+      loop: "{{ groups['linux'] }}"
+      no_log: true
+
+    - name: Configure SSH credentials for Linux hosts
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        ansible_user: "{{ linux_vm_credentials[item].username }}"
+        ansible_ssh_private_key_file: "{{ linux_key_directory.path }}/{{ item }}.pem"
+        ansible_become_password: "{{ linux_vm_credentials[item].sudo_password | default('') }}"
+      loop: "{{ groups['linux'] }}"
+      no_log: true
+
+- name: Install administrator-selected Linux patches
+  hosts: linux
+  gather_facts: false
+  become: true
+  serial: 10
+
+  vars:
+    selected_packages: []
+
+    packages_to_install: >-
+      {{
+        (
+          selected_packages.splitlines()
+          if selected_packages is string
+          else selected_packages
+        )
+        | map('trim')
+        | reject('equalto', '')
+        | list
+      }}
+
+  tasks:
+    - name: Require administrator package selection
+      ansible.builtin.assert:
+        that:
+          - packages_to_install | length > 0
+        fail_msg: >-
+          Installation blocked.
+          No Linux packages selected.
+
+    - name: Validate selected package names
+      ansible.builtin.assert:
+        that:
+          - item is string
+          - item is match('^[a-z0-9][a-z0-9+.-]*$')
+          - item is not match('^(linux-|grub|shim|systemd|libc6|ubuntu-release-upgrader)')
+        fail_msg: "Invalid or restricted package: {{ item }}"
+      loop: "{{ packages_to_install }}"
+
+    # Mandatory pre-patch backup verification
+
+    - name: Require verified backup evidence from AWX workflow
+      ansible.builtin.assert:
+        that:
+          - linux_backup_verified | default(false) | bool
+          - linux_backup_archive | default('') is match('^/mnt/linuxbackups/[A-Za-z0-9._-]+-[0-9]{8}T[0-9]{6}[.]tar[.]gz$')
+          - linux_backup_archive | default('') | basename is match('^' ~ (inventory_hostname | regex_escape) ~ '-')
+        fail_msg: >-
+          Installation blocked.
+          Verified backup evidence is missing
+          or does not match this Linux host.
+
+    - name: Verify backup storage is mounted
+      ansible.builtin.command:
+        argv:
+          - mountpoint
+          - -q
+          - /mnt/linuxbackups
+      register: backup_mount
+      changed_when: false
+      failed_when: backup_mount.rc != 0
+
+    - name: Verify backup archive exists
+      ansible.builtin.stat:
+        path: "{{ linux_backup_archive }}"
+      register: backup_file
+
+    - name: Require valid backup archive
+      ansible.builtin.assert:
+        that:
+          - backup_file.stat.exists
+          - backup_file.stat.isreg
+          - backup_file.stat.size > 0
+        fail_msg: >-
+          Installation blocked.
+          Backup archive missing or empty.
+
+    - name: Verify backup archive integrity
+      ansible.builtin.command:
+        argv:
+          - tar
+          - -tzf
+          - "{{ linux_backup_archive }}"
+      register: backup_integrity
+      changed_when: false
+
+    - name: Confirm backup verification
+      ansible.builtin.debug:
+        msg:
+          server: "{{ inventory_hostname }}"
+          backup_verified: true
+          backup_archive: "{{ linux_backup_archive }}"
+          backup_storage_mounted: true
+          archive_readable: true
+
+    # Selective patch installation
+
+    - name: Display packages before installation
+      ansible.builtin.debug:
+        msg:
+          server: "{{ inventory_hostname }}"
+          selected_packages: "{{ packages_to_install }}"
+
+    - name: Install selected Linux patches
+      ansible.builtin.apt:
+        name: "{{ packages_to_install }}"
+        state: latest
+        update_cache: true
+        only_upgrade: true
+        fail_on_autoremove: true
+      register: patch_result
+
+    - name: Get installed package versions
+      ansible.builtin.command:
+        argv:
+          - dpkg-query
+          - -W
+          - "-f=${Package} ${Version}\n"
+          - "{{ item }}"
+      loop: "{{ packages_to_install }}"
+      register: installed_versions
+      changed_when: false
+
+    - name: Check reboot requirement
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_flag
+
+    - name: Display patch installation summary
+      ansible.builtin.debug:
+        msg:
+          server: "{{ inventory_hostname }}"
+          selected_packages: "{{ packages_to_install }}"
+          installed_versions: >-
+            {{
+              installed_versions.results
+              | map(attribute='stdout')
+              | list
+            }}
+          changed: "{{ patch_result.changed }}"
+          reboot_required: "{{ reboot_flag.stat.exists }}"
+          backup_verified: true
+          installation_status: SUCCESSFUL
+
+    - name: Publish AWX patch results
+      ansible.builtin.set_stats:
+        data:
+          linux_patch_installation:
+            server: "{{ inventory_hostname }}"
+            selected_packages: "{{ packages_to_install }}"
+            installed_versions: >-
+              {{
+                installed_versions.results
+                | map(attribute='stdout')
+                | list
+              }}
+            backup_verified: true
+            backup_archive: "{{ linux_backup_archive }}"
+            reboot_required: "{{ reboot_flag.stat.exists }}"
+            status: successful
+            timestamp: "{{ now(utc=true).isoformat() }}"
+        per_host: false
+
+- name: Clean up temporary SSH credentials
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Remove temporary SSH key directory
+      ansible.builtin.file:
+        path: "{{ linux_key_directory.path }}"
+        state: absent
+      when: linux_key_directory is defined
+      no_log: true

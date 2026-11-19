@@ -1,0 +1,64 @@
+---
+- name: Windows patch workflow - safe dry-run test
+  hosts: windows
+  gather_facts: false
+  serial: 1
+
+  vars:
+    protected_host: "192.168.156.133"
+    expected_patch_cycle_id: "20261107-092419"
+    expected_snapshot_name: "AWX-PrePatch-{{ expected_patch_cycle_id }}"
+
+    selected_kb_list: >-
+      {{
+        selected_kbs | default('')
+        | regex_findall('(?i)KB[0-9]+')
+        | map('upper')
+        | unique
+        | list
+      }}
+
+  tasks:
+    - name: Validate Windows target and KB selection
+      ansible.builtin.assert:
+        that:
+          - (ansible_host | default(inventory_hostname)) == protected_host
+          - selected_kbs is defined
+          - selected_kb_list | length > 0
+          - selected_kbs | regex_replace('(?i)KB[0-9]+|[\s,]+', '') | length == 0
+        fail_msg: "Invalid Windows target or KB selection."
+
+    - name: Validate snapshot evidence from AWX workflow
+      ansible.builtin.assert:
+        that:
+          - snapshot_verified | default(false) | bool
+          - verified_snapshot_host | default('') == protected_host
+          - verified_patch_cycle_id | default('') == expected_patch_cycle_id
+          - verified_snapshot_name | default('') == expected_snapshot_name
+        fail_msg: "Snapshot evidence missing or mismatched. Workflow blocked."
+
+    - name: Discover administrator-selected Windows updates
+      ansible.windows.win_updates:
+        state: searched
+        category_names: "*"
+        accept_list: "{{ selected_kb_list }}"
+      register: pending_updates
+
+    - name: Display selected updates and snapshot details
+      ansible.builtin.debug:
+        msg:
+          server: "{{ inventory_hostname }}"
+          selected_kbs: "{{ selected_kb_list }}"
+          matching_pending_updates: "{{ pending_updates.found_update_count }}"
+          updates: "{{ pending_updates.updates }}"
+          snapshot_verified: "{{ snapshot_verified }}"
+          snapshot_name: "{{ verified_snapshot_name }}"
+          snapshot_host: "{{ verified_snapshot_host }}"
+          patch_cycle_id: "{{ verified_patch_cycle_id }}"
+
+    - name: Confirm dry-run completed
+      ansible.builtin.debug:
+        msg: "DRY RUN SUCCESSFUL - No updates installed and no reboot performed."
+
+    - name: Stop workflow before patch installation
+      ansible.builtin.meta: end_play

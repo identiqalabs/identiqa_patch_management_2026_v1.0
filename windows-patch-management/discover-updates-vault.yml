@@ -1,0 +1,79 @@
+---
+- name: Windows Patch Discovery with Vault Credentials
+  hosts: windows
+  gather_facts: false
+
+  vars_files:
+    - windows_credentials.yml
+
+  vars:
+    ansible_connection: winrm
+    ansible_port: 5985
+    ansible_winrm_transport: ntlm
+    ansible_user: "{{ windows_vm_credentials[inventory_hostname].username }}"
+    ansible_password: "{{ windows_vm_credentials[inventory_hostname].password }}"
+
+  tasks:
+    - name: Check Windows connectivity
+      ansible.windows.win_ping:
+
+    - name: Discover all pending Windows updates
+      ansible.windows.win_updates:
+        state: searched
+        category_names: '*'
+      register: pending_updates
+
+    - name: Query Windows Update Agent download status (read-only)
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $session = New-Object -ComObject Microsoft.Update.Session
+          $searcher = $session.CreateUpdateSearcher()
+          $results = $searcher.Search("IsInstalled=0")
+          $updates = @()
+          foreach ($update in $results.Updates) {
+            $updates += @{
+              update_id = [string]$update.Identity.UpdateID
+              revision = [int]$update.Identity.RevisionNumber
+              title = [string]$update.Title
+              downloaded = [bool]$update.IsDownloaded
+            }
+          }
+          $Ansible.Result = @{ updates = $updates }
+          $Ansible.Changed = $false
+      register: download_status
+      changed_when: false
+
+    - name: Display pending update summary
+      ansible.builtin.debug:
+        msg: |
+          ==========================================
+          SERVER: {{ inventory_hostname }}
+          TOTAL PENDING UPDATES: {{ pending_updates.found_update_count | default(0) }}
+          ==========================================
+
+    - name: Display individual pending patches
+      ansible.builtin.debug:
+        msg: |
+          KB Number: {{ item.value.kb | default([]) | join(', ') }}
+          Title: {{ item.value.title | default('Unknown') }}
+          Installed: {{ item.value.installed | default(false) }}
+          Downloaded: {{ matching_download_status[0].downloaded if matching_download_status | length == 1 else 'Unknown (no unique update match)' }}
+          ------------------------------------------
+      vars:
+        matching_download_status: >-
+          {{ download_status.result.updates | default([])
+             | selectattr('update_id', 'equalto', item.key)
+             | list }}
+      loop: "{{ pending_updates.updates | default({}) | dict2items }}"
+      loop_control:
+        label: "{{ item.value.title | default(item.key) }}"
+
+    - name: Display filtered updates
+      ansible.builtin.debug:
+        var: pending_updates.filtered_updates
+
+    - name: No pending patches found
+      ansible.builtin.debug:
+        msg: "No pending Windows updates on {{ inventory_hostname }}"
+      when: pending_updates.found_update_count | default(0) | int == 0

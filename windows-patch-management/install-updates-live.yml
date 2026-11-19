@@ -1,0 +1,251 @@
+---
+- name: Verify lab SMB configuration backup and install selected Windows updates
+  hosts: windows
+  gather_facts: false
+  serial: 1
+  # Lab safety: only one host per workflow run; use AWX Limit for the chosen host.
+
+  vars_files:
+    - windows_credentials.yml
+
+  vars:
+    ansible_connection: winrm
+    ansible_port: 5985
+    ansible_winrm_transport: ntlm
+    ansible_user: "{{ windows_vm_credentials[inventory_hostname].username }}"
+    ansible_password: "{{ windows_vm_credentials[inventory_hostname].password }}"
+
+    current_patch_cycle_id: "{{ (tower_workflow_job_id | default(awx_workflow_job_id | default(''), true)) | string }}"
+    selected_kb_list: >-
+      {{ selected_kbs | default('') | regex_findall('(?i)KB[0-9]+') | map('upper') | unique | list }}
+
+  tasks:
+    - name: Validate lab-only target, approval inputs, and workflow backup evidence
+      ansible.builtin.assert:
+        that:
+          - lab_allow_patch_without_system_backup | default(false) | bool
+          - "'windows' in group_names"
+          - ansible_play_hosts_all | length == 1
+          - selected_kbs is defined
+          - selected_kbs is string
+          - selected_kb_list | length > 0
+          - selected_kbs | regex_replace('(?i)KB[0-9]+|[\s,]+', '') | length == 0
+          - backup_test_verified | default(false) | bool
+          - not (backup_verified | default(false) | bool)
+          - backup_type | default('') == 'config_export'
+          - verified_backup_host | default('') | string == (ansible_host | default(inventory_hostname)) | string
+          - verified_backup_cycle_id | default('') | string == current_patch_cycle_id
+          - current_patch_cycle_id | length > 0
+          - verified_backup_destination | default('') | length > 0
+          - verified_backup_hostname | default('') | length > 0
+          - verified_backup_sha256 | default('') is match('^[a-fA-F0-9]{64}$')
+          - verified_backup_id | default('') is match('^config-[A-Za-z0-9-]+-[0-9]{8}-[0-9]{6}-[a-fA-F0-9]{8}\\.zip$')
+          - backup_share_username is defined
+          - backup_share_password is defined
+          - backup_share_username | length > 0
+          - backup_share_password | length > 0
+        fail_msg: >-
+          Installation blocked: lab authorization, target, selected KBs,
+          or current-workflow SMB configuration backup evidence is invalid.
+
+    - name: Verify Windows connectivity
+      ansible.windows.win_ping:
+
+    - name: Get actual Windows hostname
+      ansible.windows.win_command: hostname
+      register: windows_hostname
+      changed_when: false
+
+    - name: Ensure configuration backup belongs to this Windows machine
+      ansible.builtin.assert:
+        that:
+          - windows_hostname.stdout | trim == verified_backup_hostname
+        fail_msg: "Installation blocked: Windows hostname differs from backup evidence."
+
+    - name: Independently verify SMB configuration backup archive and contents
+      ansible.windows.win_powershell:
+        parameters:
+          Destination: "{{ verified_backup_destination }}"
+          Machine: "{{ verified_backup_hostname }}"
+          FileName: "{{ verified_backup_id }}"
+          ExpectedHash: "{{ verified_backup_sha256 }}"
+          CycleId: "{{ current_patch_cycle_id }}"
+          Username: "{{ backup_share_username }}"
+        sensitive_parameters:
+          - name: Password
+            value: "{{ backup_share_password }}"
+        script: |
+          param(
+            [string]$Destination,
+            [string]$Machine,
+            [string]$FileName,
+            [string]$ExpectedHash,
+            [string]$CycleId,
+            [string]$Username,
+            [SecureString]$Password
+          )
+          $ErrorActionPreference = 'Stop'
+          $drive = $null
+          $zip = $null
+          try {
+            if ($Destination -notmatch '^\\\\[^\\]+\\[^\\]+$') {
+              throw 'Backup destination must be a UNC share root.'
+            }
+            if ($Machine -notmatch '^[A-Za-z0-9-]+$') {
+              throw 'Invalid Windows hostname in backup evidence.'
+            }
+            if ($FileName -notmatch '^config-[A-Za-z0-9-]+-[0-9]{8}-[0-9]{6}-[a-fA-F0-9]{8}\.zip$') {
+              throw 'Invalid configuration backup filename.'
+            }
+            if ($ExpectedHash -notmatch '^[a-fA-F0-9]{64}$') {
+              throw 'Invalid SHA256 in backup evidence.'
+            }
+            $credential = [PSCredential]::new($Username, $Password)
+            $drive = New-PSDrive -Name AWXVerify -PSProvider FileSystem `
+              -Root $Destination -Credential $credential -ErrorAction Stop
+
+            $path = Join-Path $drive.Root "AWX-ConfigBackups\$Machine\$FileName"
+            if (-not [System.IO.File]::Exists($path)) {
+              throw 'SMB configuration backup file does not exist.'
+            }
+            $length = [System.IO.FileInfo]::new($path).Length
+            if ($length -le 0) {
+              throw 'Configuration backup file is empty.'
+            }
+
+            # Integrity: archive on the share must match the hash recorded by the backup run
+            $actualHash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+            if ($actualHash -ne $ExpectedHash) {
+              throw 'Backup archive SHA256 does not match backup evidence.'
+            }
+
+            # Contents: archive must open and its metadata must match this machine and workflow
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($path)
+
+            $fileEntries = @($zip.Entries | Where-Object { $_.Name })
+            if ($fileEntries.Count -lt 5) {
+              throw "Backup archive contains only $($fileEntries.Count) files."
+            }
+
+            $info = $zip.Entries | Where-Object { $_.FullName -eq 'backup-info.txt' } | Select-Object -First 1
+            if ($null -eq $info) {
+              throw 'backup-info.txt is missing from the archive.'
+            }
+            $reader = [System.IO.StreamReader]::new($info.Open())
+            try { $content = $reader.ReadToEnd() } finally { $reader.Dispose() }
+
+            $lines = $content -split "`r?`n"
+            if (-not ($lines -contains "Hostname: $Machine")) {
+              throw 'Backup archive hostname does not match.'
+            }
+            if (-not ($lines -contains "Workflow: $CycleId")) {
+              throw 'Backup archive workflow ID does not match.'
+            }
+            if (-not ($lines -contains 'BackupType: Windows configuration export')) {
+              throw 'Unexpected backup archive type.'
+            }
+
+            $Ansible.Result = @{
+              verified = $true
+              file = $FileName
+              size_bytes = $length
+              sha256 = $actualHash
+              items_in_archive = $fileEntries.Count
+              backup_type = 'config_export'
+              recovery_ready = $false
+            }
+            $Ansible.Changed = $false
+          }
+          finally {
+            if ($null -ne $zip) {
+              $zip.Dispose()
+            }
+            if ($null -ne $drive) {
+              Remove-PSDrive -Name AWXVerify -Force -ErrorAction SilentlyContinue
+            }
+          }
+      register: backup_check
+      changed_when: false
+      no_log: false
+
+    - name: Require independently verified SMB configuration backup
+      ansible.builtin.assert:
+        that:
+          - backup_check.result.verified | default(false) | bool
+          - backup_check.result.size_bytes | default(0) | int > 0
+          - backup_check.result.sha256 | default('') | upper == verified_backup_sha256 | upper
+          - backup_check.result.backup_type | default('') == 'config_export'
+          - not (backup_check.result.recovery_ready | default(true) | bool)
+        fail_msg: "Installation blocked: SMB configuration backup verification failed."
+
+    - name: Discover administrator-selected pending updates
+      ansible.windows.win_updates:
+        state: searched
+        category_names: '*'
+        accept_list: "{{ selected_kb_list }}"
+      register: pending_updates
+
+    - name: Require at least one applicable selected update
+      ansible.builtin.assert:
+        that:
+          - pending_updates.found_update_count | int > 0
+        fail_msg: "No selected KBs are currently applicable; installation skipped."
+
+    - name: Show lab installation readiness
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          selected_kbs: "{{ selected_kb_list }}"
+          applicable_updates: "{{ pending_updates.found_update_count }}"
+          config_backup_file: "{{ verified_backup_id }}"
+          backup_test_verified: true
+          system_backup_verified: false
+          recovery_ready: false
+          lab_only: true
+
+    - name: Install administrator-selected Windows updates (LAB ONLY)
+      ansible.windows.win_updates:
+        state: installed
+        category_names: '*'
+        accept_list: "{{ selected_kb_list }}"
+        reboot: true
+        reboot_timeout: 3600
+      register: install_result
+
+    - name: Check selected updates after installation
+      ansible.windows.win_updates:
+        state: searched
+        category_names: '*'
+        accept_list: "{{ selected_kb_list }}"
+      register: remaining_updates
+
+    - name: Require no selected updates remain pending
+      ansible.builtin.assert:
+        that:
+          - install_result.failed_update_count | default(0) | int == 0
+          - remaining_updates.found_update_count | int == 0
+        fail_msg: "One or more selected updates failed or remain pending."
+
+    - name: Publish Windows installation results to AWX
+      ansible.builtin.set_stats:
+        data:
+          windows_patch_installation:
+            server: "{{ inventory_hostname }}"
+            selected_kbs: "{{ selected_kb_list }}"
+            backup_type: config_export
+            backup_test_verified: true
+            system_backup_verified: false
+            recovery_ready: false
+            workflow_id: "{{ current_patch_cycle_id }}"
+            status: successful
+        per_host: false
+
+    - name: Display installation summary
+      ansible.builtin.debug:
+        msg:
+          server: "{{ inventory_hostname }}"
+          selected_kbs: "{{ selected_kb_list }}"
+          remaining_selected_updates: "{{ remaining_updates.found_update_count }}"
+          status: SUCCESSFUL_LAB_INSTALLATION
+          recovery_ready: false

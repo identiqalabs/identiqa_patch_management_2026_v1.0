@@ -1,0 +1,61 @@
+
+---
+- name: Discover all pending Windows updates
+  hosts: windows
+  gather_facts: false
+  serial: 10
+
+  tasks:
+    - name: Get actual Windows hostname
+      ansible.windows.win_command: hostname
+      register: windows_hostname
+      changed_when: false
+
+    - name: Validate Windows hostname
+      ansible.builtin.assert:
+        that:
+          - windows_hostname.stdout | trim is match('^[A-Za-z0-9-]{1,63}$')
+        fail_msg: "Unable to retrieve a valid Windows hostname."
+
+    - name: Display Windows hostname
+      ansible.builtin.debug:
+        msg:
+          inventory_host: "{{ inventory_hostname }}"
+          windows_hostname: "{{ windows_hostname.stdout | trim }}"
+
+    - name: Search for all applicable pending Windows updates
+      ansible.windows.win_updates:
+        state: searched
+        category_names: "*"
+      register: pending_updates
+
+    - name: Display pending update count
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} has {{ pending_updates.found_update_count }} pending updates"
+
+    - name: Display individual pending updates
+      ansible.builtin.debug:
+        msg:
+          server: "{{ inventory_hostname }}"
+          kb: "{{ item.value.kb | default([]) }}"
+          title: "{{ item.value.title | default('Unknown') }}"
+          categories: "{{ item.value.categories | default([]) }}"
+          update_id: "{{ item.key }}"
+      loop: "{{ pending_updates.updates | default({}) | dict2items }}"
+      loop_control:
+        label: "{{ item.value.title | default(item.key) }}"
+
+    - name: Display discovery summary
+      ansible.builtin.debug:
+        msg:
+          server: "{{ inventory_hostname }}"
+          windows_hostname: "{{ windows_hostname.stdout | trim }}"
+          pending_count: "{{ pending_updates.found_update_count }}"
+          status: "Discovery completed. No updates installed."
+
+    - name: Publish Windows hostname to AWX workflow
+      ansible.builtin.set_stats:
+        data:
+          discovered_windows_hostname: "{{ windows_hostname.stdout | trim }}"
+          discovered_windows_host_ip: "{{ ansible_host | default(inventory_hostname) }}"
+        per_host: false

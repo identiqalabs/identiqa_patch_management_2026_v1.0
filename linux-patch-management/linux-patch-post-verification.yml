@@ -1,0 +1,185 @@
+
+---
+- name: Prepare Linux SSH credentials
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars_files:
+    - linux_credentials.yml
+
+  tasks:
+    - name: Create temporary SSH key directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: awx-linux-verify-keys-
+      register: linux_key_directory
+
+    - name: Write SSH private keys from Vault
+      ansible.builtin.copy:
+        content: "{{ linux_vm_credentials[item].ssh_private_key | trim }}\n"
+        dest: "{{ linux_key_directory.path }}/{{ item }}.pem"
+        mode: "0600"
+      loop: "{{ groups['linux'] }}"
+      no_log: true
+
+    - name: Configure SSH credentials for Linux hosts
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        ansible_user: "{{ linux_vm_credentials[item].username }}"
+        ansible_ssh_private_key_file: "{{ linux_key_directory.path }}/{{ item }}.pem"
+        ansible_become_password: "{{ linux_vm_credentials[item].sudo_password | default('') }}"
+      loop: "{{ groups['linux'] }}"
+      no_log: true
+
+- name: Linux Post-Patch Verification
+  hosts: linux
+  gather_facts: false
+  become: false
+  serial: 10
+
+  vars:
+    selected_packages: []
+
+    packages_to_verify: >-
+      {{
+        (
+          selected_packages.splitlines()
+          if selected_packages is string
+          else selected_packages
+        )
+        | map('trim')
+        | reject('equalto', '')
+        | list
+      }}
+
+  tasks:
+    - name: Require selected packages
+      ansible.builtin.assert:
+        that:
+          - packages_to_verify | length > 0
+        fail_msg: >-
+          Verification blocked.
+          No Linux packages selected.
+
+    - name: Validate selected package names
+      ansible.builtin.assert:
+        that:
+          - item is string
+          - item is match('^[a-z0-9][a-z0-9+.-]*$')
+        fail_msg: "Invalid package name: {{ item }}"
+      loop: "{{ packages_to_verify }}"
+
+    - name: Get installed package versions and status
+      ansible.builtin.command:
+        argv:
+          - dpkg-query
+          - -W
+          - "-f=${Version} ${Status}"
+          - "{{ item }}"
+      loop: "{{ packages_to_verify }}"
+      register: installed_packages
+      changed_when: false
+      failed_when: false
+
+    - name: Verify selected packages are installed
+      ansible.builtin.assert:
+        that:
+          - item.rc == 0
+          - "'install ok installed' in item.stdout"
+        fail_msg: >-
+          Verification failed.
+          Package {{ item.item }} is not correctly installed.
+      loop: "{{ installed_packages.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Get remaining pending updates
+      ansible.builtin.command:
+        argv:
+          - apt
+          - list
+          - --upgradable
+      register: pending_updates
+      changed_when: false
+
+    - name: Extract pending package names
+      ansible.builtin.set_fact:
+        pending_package_names: >-
+          {{
+            pending_updates.stdout_lines
+            | select('search', '/')
+            | map('regex_replace', '/.*$', '')
+            | list
+          }}
+
+    - name: Verify selected packages are no longer pending
+      ansible.builtin.assert:
+        that:
+          - item not in pending_package_names
+        fail_msg: >-
+          Verification failed.
+          Package {{ item }} still has a pending update.
+      loop: "{{ packages_to_verify }}"
+
+    - name: Check reboot requirement
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_status
+
+    - name: Get running kernel
+      ansible.builtin.command:
+        argv:
+          - uname
+          - -r
+      register: running_kernel
+      changed_when: false
+
+    - name: Display post-patch verification report
+      ansible.builtin.debug:
+        msg:
+          server: "{{ inventory_hostname }}"
+          selected_packages: "{{ packages_to_verify }}"
+          installed_package_details: >-
+            {{
+              installed_packages.results
+              | map(attribute='stdout')
+              | list
+            }}
+          remaining_pending_updates: "{{ pending_package_names }}"
+          running_kernel: "{{ running_kernel.stdout }}"
+          reboot_required: "{{ reboot_status.stat.exists }}"
+          verification_status: PASSED
+
+    - name: Publish verification artifacts
+      ansible.builtin.set_stats:
+        data:
+          linux_patch_verification_passed: true
+          patch_verification:
+            server: "{{ inventory_hostname }}"
+            selected_packages: "{{ packages_to_verify }}"
+            installed_package_details: >-
+              {{
+                installed_packages.results
+                | map(attribute='stdout')
+                | list
+              }}
+            remaining_pending_updates: "{{ pending_package_names }}"
+            running_kernel: "{{ running_kernel.stdout }}"
+            reboot_required: "{{ reboot_status.stat.exists }}"
+            status: PASSED
+            timestamp: "{{ now(utc=true).isoformat() }}"
+        per_host: false
+
+- name: Clean up temporary SSH credentials
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Remove temporary SSH key directory
+      ansible.builtin.file:
+        path: "{{ linux_key_directory.path }}"
+        state: absent
+      when: linux_key_directory is defined
+      no_log: true

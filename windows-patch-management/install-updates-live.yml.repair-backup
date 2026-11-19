@@ -1,0 +1,103 @@
+---
+- name: Install administrator-selected Windows updates
+  hosts: windows
+  gather_facts: false
+  serial: 1
+
+  vars:
+    protected_host: "192.168.156.133"
+    expected_patch_cycle_id: "{{ tower_workflow_job_id | default(awx_workflow_job_id | default(""), true) }}"
+    expected_snapshot_name: "AWX-PrePatch-{{ expected_patch_cycle_id }}"
+
+    selected_kb_list: >-
+      {{
+        selected_kbs | default('')
+        | regex_findall('(?i)KB[0-9]+')
+        | map('upper')
+        | unique
+        | list
+      }}
+
+  tasks:
+    - name: Validate Windows target and KB selection
+      ansible.builtin.assert:
+        that:
+          - (ansible_host | default(inventory_hostname)) == protected_host
+          - selected_kbs is defined
+          - selected_kb_list | length > 0
+          - selected_kbs | regex_replace('(?i)KB[0-9]+|[\s,]+', '') | length == 0
+        fail_msg: "Invalid target or KB selection."
+
+    - name: Validate snapshot evidence
+      ansible.builtin.assert:
+        that:
+          - snapshot_verified | default(false) | bool
+          - verified_snapshot_host | default('') == protected_host
+          - verified_patch_cycle_id | default('') == expected_patch_cycle_id
+          - verified_snapshot_name | default('') == expected_snapshot_name
+        fail_msg: "Snapshot verification evidence missing or mismatched."
+
+    - name: Discover selected pending updates
+      ansible.windows.win_updates:
+        state: searched
+        category_names: "*"
+        accept_list: "{{ selected_kb_list }}"
+      register: pending_updates
+
+    - name: Display selected pending updates
+      ansible.builtin.debug:
+        msg:
+          server: "{{ inventory_hostname }}"
+          selected_kbs: "{{ selected_kb_list }}"
+          pending_count: "{{ pending_updates.found_update_count }}"
+          snapshot: "{{ verified_snapshot_name }}"
+
+    - name: Require at least one applicable update
+      ansible.builtin.assert:
+        that:
+          - pending_updates.found_update_count | int > 0
+        fail_msg: "No selected updates are currently applicable."
+
+    - name: Install selected Windows updates
+      ansible.windows.win_updates:
+        state: installed
+        category_names: "*"
+        accept_list: "{{ selected_kb_list }}"
+        reboot: true
+        reboot_timeout: 3600
+      register: install_result
+
+    - name: Check selected updates after installation
+      ansible.windows.win_updates:
+        state: searched
+        category_names: "*"
+        accept_list: "{{ selected_kb_list }}"
+      register: remaining_updates
+
+    - name: Confirm selected updates are no longer pending
+      ansible.builtin.assert:
+        that:
+          - remaining_updates.found_update_count | int == 0
+        fail_msg: "Some selected updates remain pending."
+
+    - name: Display installation summary
+      ansible.builtin.debug:
+        msg:
+          server: "{{ inventory_hostname }}"
+          selected_kbs: "{{ selected_kb_list }}"
+          installed_count: "{{ install_result.installed_update_count | default(0) }}"
+          remaining_updates: "{{ remaining_updates.found_update_count }}"
+          status: "Patch installation and verification completed"
+
+    - name: Publish patch report to AWX
+      ansible.builtin.set_stats:
+        data:
+          patch_report:
+            server: "{{ inventory_hostname }}"
+            selected_kbs: "{{ selected_kb_list }}"
+            installed_count: "{{ install_result.installed_update_count | default(0) }}"
+            remaining_updates: "{{ remaining_updates.found_update_count }}"
+            snapshot_name: "{{ verified_snapshot_name }}"
+            patch_cycle_id: "{{ verified_patch_cycle_id }}"
+            status: "SUCCESS"
+        per_host: false

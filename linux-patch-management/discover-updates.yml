@@ -1,0 +1,15 @@
+---
+- name: Linux Patch Discovery
+  hosts: all
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Discover available APT updates
+      ansible.builtin.raw: apt-get -s upgrade
+      register: patch_result
+      changed_when: false
+
+    - name: Display available updates
+      ansible.builtin.debug:
+        msg: "{{ patch_result.stdout_lines }}"

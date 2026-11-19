@@ -1,0 +1,24 @@
+- name: Install administrator-selected Windows updates
+  hosts: windows
+  gather_facts: false
+  serial: 1
+  vars:
+    protected_host: 192.168.156.133
+    expected_patch_cycle_id: '{{ tower_workflow_job_id | default(awx_workflow_job_id
+      | default(None, true), true) }}'
+    expected_snapshot_name: AWX-PrePatch-{{ expected_patch_cycle_id }}
+    selected_kb_list: "{{\n  selected_kbs | default('')\n  | regex_findall('(?i)KB[0-9]+')\n\
+      \  | map('upper')\n  | unique\n  | list\n}}"
+  tasks:
+  - name: Validate snapshot evidence
+    ansible.builtin.assert:
+      that:
+      - snapshot_verified | default(false) | bool
+      - verified_snapshot_host | default('') == protected_host
+      - verified_patch_cycle_id | default('') == expected_patch_cycle_id
+      - verified_snapshot_name | default('') == expected_snapshot_name
+      fail_msg: Snapshot verification evidence missing or mismatched.
+  - name: Display successful snapshot evidence validation
+    ansible.builtin.debug:
+      msg: Snapshot evidence matches workflow ID and Windows host. Installation remains
+        disabled.

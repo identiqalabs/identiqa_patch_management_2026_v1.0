@@ -1,0 +1,94 @@
+
+---
+- name: Prepare Linux SSH credentials
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars_files:
+    - linux_credentials.yml
+
+  tasks:
+    - name: Create temporary directory for SSH keys
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: awx-linux-keys-
+      register: linux_key_directory
+      no_log: false
+
+    - name: Prepare SSH credentials for Linux hosts
+      ansible.builtin.include_tasks: prepare-linux-key.yml
+      loop: "{{ groups['linux'] }}"
+      loop_control:
+        loop_var: target_host
+
+    - name: Store temporary directory for cleanup
+      ansible.builtin.set_stats:
+        data:
+          linux_ssh_key_directory: "{{ linux_key_directory.path }}"
+        per_host: false
+
+- name: Linux Patch Assessment
+  hosts: linux
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Get OS information
+      ansible.builtin.command: cat /etc/os-release
+      register: os_info
+      changed_when: false
+
+    - name: Get running kernel
+      ansible.builtin.command: uname -r
+      register: running_kernel
+      changed_when: false
+
+    - name: Get kernel package versions
+      ansible.builtin.command: apt-cache policy linux-image-generic
+      register: kernel_policy
+      changed_when: false
+
+    - name: Get pending updates
+      ansible.builtin.command: apt list --upgradable
+      register: pending_updates
+      changed_when: false
+
+    - name: Check reboot requirement
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_status
+
+    - name: Display assessment
+      ansible.builtin.debug:
+        msg:
+          server: "{{ inventory_hostname }}"
+          os: "{{ os_info.stdout_lines | select('match', '^PRETTY_NAME=') | first }}"
+          running_kernel: "{{ running_kernel.stdout }}"
+          kernel_versions: "{{ kernel_policy.stdout_lines | select('match', '^  (Installed|Candidate):') | list }}"
+          pending_updates: "{{ pending_updates.stdout_lines | reject('match', '^Listing') | reject('equalto', '') | list }}"
+          reboot_required: "{{ reboot_status.stat.exists }}"
+
+    - name: Get Linux hostname
+      ansible.builtin.command: hostname
+      register: linux_hostname
+      changed_when: false
+
+    - name: Publish Linux discovery evidence
+      ansible.builtin.set_stats:
+        data:
+          discovered_linux_hostname: "{{ linux_hostname.stdout }}"
+          discovered_linux_host_ip: "{{ ansible_host | default(inventory_hostname) }}"
+        per_host: false
+
+- name: Clean up temporary SSH credentials
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Remove temporary SSH key directory
+      ansible.builtin.file:
+        path: "{{ linux_ssh_key_directory }}"
+        state: absent
+      when: linux_ssh_key_directory is defined
+      no_log: false

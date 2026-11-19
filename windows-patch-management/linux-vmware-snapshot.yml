@@ -1,0 +1,110 @@
+---
+- name: Linux VMware pre-patch snapshot
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    patch_cycle_id: >-
+      {{
+        tower_workflow_job_id
+        | default(awx_workflow_job_id | default('unknown'), true)
+        | string
+      }}
+    vmware_host: "172.17.99.161"
+    vmware_user: "shivamgargidentiqal"
+    ssh_key: >-
+      {{
+        ansible_ssh_private_key_file
+        | default(lookup('env', 'ANSIBLE_PRIVATE_KEY_FILE'), true)
+      }}
+
+  tasks:
+    - name: Validate Linux discovery and workflow evidence
+      ansible.builtin.assert:
+        that:
+          - discovered_linux_hostname is defined
+          - discovered_linux_host_ip is defined
+          - discovered_linux_hostname is match('^[A-Za-z0-9-]{1,63}$')
+          - discovered_linux_host_ip | length > 0
+          - patch_cycle_id != 'unknown'
+        fail_msg: "Linux discovery evidence missing or invalid."
+
+    - name: Configure trusted VMware SSH host key
+      ansible.builtin.known_hosts:
+        name: "{{ vmware_host }}"
+        key: "172.17.99.161 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIETRERsyEManulS8o189e43pHlSYNs1qpmg3abqePyvt"
+
+    - name: Create Linux VMware snapshot
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - StrictHostKeyChecking=yes
+          - -i
+          - "{{ ssh_key }}"
+          - "{{ vmware_user }}@{{ vmware_host }}"
+          - "linux-create {{ patch_cycle_id }} {{ discovered_linux_hostname }}"
+      register: snapshot_result
+      changed_when: "'CREATED:' in snapshot_result.stdout"
+
+    - name: Extract snapshot name
+      ansible.builtin.set_fact:
+        snapshot_name: >-
+          {{
+            snapshot_result.stdout
+            | regex_findall('(?:CREATED|REUSED): (Linux-[A-Za-z0-9-]+-[0-9]{8}-[0-9]{6}-IST)')
+            | first
+          }}
+
+    - name: Verify Linux snapshot
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - StrictHostKeyChecking=yes
+          - -i
+          - "{{ ssh_key }}"
+          - "{{ vmware_user }}@{{ vmware_host }}"
+          - "linux-verify {{ snapshot_name }}"
+      register: verification_result
+      changed_when: false
+
+    - name: Validate snapshot verification
+      ansible.builtin.assert:
+        that:
+          - "'Snapshot verified:' in verification_result.stdout"
+          - snapshot_name in verification_result.stdout
+          - snapshot_name is match('^Linux-' ~ (discovered_linux_hostname | regex_escape) ~ '-[0-9]{8}-[0-9]{6}-IST$')
+        fail_msg: "Linux snapshot verification failed."
+
+    - name: Display snapshot details
+      ansible.builtin.debug:
+        msg:
+          hostname: "{{ discovered_linux_hostname }}"
+          server: "{{ discovered_linux_host_ip }}"
+          snapshot: "{{ snapshot_name }}"
+          patch_cycle_id: "{{ patch_cycle_id }}"
+          status: "Pre-patch snapshot verified"
+
+    - name: Publish verified Linux snapshot evidence
+      ansible.builtin.set_stats:
+        data:
+          linux_snapshot_verified: true
+          linux_verified_snapshot_name: "{{ snapshot_name }}"
+          linux_verified_snapshot_host: "{{ discovered_linux_host_ip }}"
+          linux_verified_snapshot_hostname: "{{ discovered_linux_hostname }}"
+          linux_verified_patch_cycle_id: "{{ patch_cycle_id }}"
+          linux_backup_provider: "vmware_workstation"
+
+          backup_verified: true
+          backup_provider: "vmware"
+          backup_type: "vm_snapshot"
+          verified_backup_id: "{{ snapshot_name }}"
+          verified_backup_host: "{{ discovered_linux_host_ip }}"
+          verified_backup_cycle_id: "{{ patch_cycle_id }}"
+        per_host: false

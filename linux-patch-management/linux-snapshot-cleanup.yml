@@ -1,0 +1,74 @@
+---
+- name: Linux VMware Snapshot Cleanup - Dry Run
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    patch_cycle_id: >-
+      {{
+        tower_workflow_job_id
+        | default(awx_workflow_job_id | default('unknown'), true)
+        | string
+      }}
+
+    vmware_host: "172.17.99.161"
+    vmware_user: "shivamgargidentiqal"
+
+    ssh_key: >-
+      {{
+        ansible_ssh_private_key_file
+        | default(lookup('env', 'ANSIBLE_PRIVATE_KEY_FILE'), true)
+      }}
+
+  tasks:
+    - name: Require successful verification and snapshot evidence
+      ansible.builtin.assert:
+        that:
+          - patch_cycle_id != 'unknown'
+          - linux_patch_verification_passed | default(false) | bool
+          - linux_snapshot_verified | default(false) | bool
+          - linux_backup_provider | default('') == 'vmware_workstation'
+          - (linux_verified_patch_cycle_id | default('') | string) == patch_cycle_id
+          - linux_verified_snapshot_name | default('') is match('^Linux-[A-Za-z0-9-]+-[0-9]{8}-[0-9]{6}-IST$')
+          - not (patch_verification.reboot_required | default(true) | bool)
+        fail_msg: "Cleanup blocked: verified patch-cycle evidence missing, mismatched, or reboot pending."
+
+    - name: Ensure SSH directory exists
+      ansible.builtin.file:
+        path: /runner/.ssh
+        state: directory
+        mode: "0700"
+
+    - name: Configure trusted VMware SSH host key
+      ansible.builtin.known_hosts:
+        name: "{{ vmware_host }}"
+        key: "172.17.99.161 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIETRERsyEManulS8o189e43pHlSYNs1qpmg3abqePyvt"
+
+    - name: Preview snapshot cleanup
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - StrictHostKeyChecking=yes
+          - -i
+          - "{{ ssh_key }}"
+          - "{{ vmware_user }}@{{ vmware_host }}"
+          - "linux-cleanup {{ patch_cycle_id }} {{ linux_verified_snapshot_name }}"
+      register: cleanup_preview
+      changed_when: false
+
+    - name: Display cleanup preview
+      ansible.builtin.debug:
+        var: cleanup_preview.stdout_lines
+
+    - name: Publish cleanup preview results
+      ansible.builtin.set_stats:
+        data:
+          linux_snapshot_cleanup_mode: "dry_run"
+          linux_snapshot_cleanup_cycle_id: "{{ patch_cycle_id }}"
+          linux_snapshot_cleanup_current_snapshot: "{{ linux_verified_snapshot_name }}"
+          linux_snapshot_cleanup_preview: "{{ cleanup_preview.stdout_lines }}"
+        per_host: false

@@ -1,0 +1,51 @@
+---
+- name: Automated Ubuntu Patch Installation
+  hosts: all
+  become: true
+  gather_facts: false
+  serial: 10
+
+  tasks:
+    - name: Refresh APT package lists
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Discover pending updates
+      ansible.builtin.shell: apt-get -s upgrade | grep '^Inst ' || true
+      register: pending_updates
+      changed_when: false
+
+    - name: Display pending updates
+      ansible.builtin.debug:
+        msg: "{{ pending_updates.stdout_lines }}"
+
+    - name: Install available package updates
+      ansible.builtin.apt:
+        upgrade: safe
+        dpkg_options: force-confdef,force-confold
+      register: patch_result
+
+    - name: Check if reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_flag
+
+    - name: Reboot if required
+      ansible.builtin.reboot:
+        reboot_timeout: 1800
+        post_reboot_delay: 30
+      when: reboot_flag.stat.exists
+
+    - name: Verify remaining updates
+      ansible.builtin.shell: apt-get -s upgrade | grep '^Inst ' || true
+      register: remaining_updates
+      changed_when: false
+
+    - name: Display patch summary
+      ansible.builtin.debug:
+        msg:
+          server: "{{ inventory_hostname }}"
+          patch_task_changed: "{{ patch_result.changed }}"
+          reboot_required: "{{ reboot_flag.stat.exists }}"
+          remaining_updates: "{{ remaining_updates.stdout_lines }}"

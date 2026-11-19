@@ -1,0 +1,110 @@
+
+---
+- name: Windows Post-Patch Verification
+  hosts: windows
+  gather_facts: false
+  serial: 1
+
+  vars:
+    selected_kb_list: >-
+      {{
+        selected_kbs | default('')
+        | regex_findall('(?i)KB[0-9]+')
+        | map('upper')
+        | unique
+        | list
+      }}
+
+  tasks:
+    - name: Require valid administrator-selected KBs
+      ansible.builtin.assert:
+        that:
+          - selected_kbs is defined
+          - selected_kb_list | length > 0
+          - selected_kbs | regex_replace('(?i)KB[0-9]+|[\s,]+', '') | length == 0
+        fail_msg: "Verification blocked: invalid KB selection."
+
+    - name: Get Windows hostname
+      ansible.windows.win_command: hostname
+      register: windows_hostname
+      changed_when: false
+
+    - name: Get Windows operating system details
+      ansible.windows.win_powershell:
+        script: |
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, BuildNumber |
+            ConvertTo-Json -Compress
+      register: os_details
+      changed_when: false
+
+    - name: Check selected KB installation history
+      ansible.windows.win_powershell:
+        script: |
+          $selected = @(
+          {{ selected_kb_list | map('to_json') | join(",`n") }}
+          )
+          $installed = @(Get-HotFix | Select-Object -ExpandProperty HotFixID)
+          $result = foreach ($kb in $selected) {
+            [PSCustomObject]@{
+              KB = $kb
+              ListedInHotFix = ($kb -in $installed)
+            }
+          }
+          $result | ConvertTo-Json -Compress
+      register: hotfix_results
+      changed_when: false
+
+    - name: Check remaining selected Windows updates
+      ansible.windows.win_updates:
+        state: searched
+        category_names: "*"
+        accept_list: "{{ selected_kb_list }}"
+      register: remaining_updates
+
+    - name: Check Windows pending reboot indicators
+      ansible.windows.win_powershell:
+        script: |
+          $paths = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+          )
+          $pending = $false
+          foreach ($path in $paths) {
+            if (Test-Path $path) { $pending = $true }
+          }
+          $pending
+      register: reboot_check
+      changed_when: false
+
+    - name: Verify no selected KB remains pending
+      ansible.builtin.assert:
+        that:
+          - remaining_updates.found_update_count | int == 0
+        fail_msg: "Verification failed: selected Windows updates remain pending."
+
+    - name: Publish Windows verification report
+      ansible.builtin.set_stats:
+        data:
+          windows_patch_verification_passed: true
+          windows_patch_verification:
+            server: "{{ inventory_hostname }}"
+            hostname: "{{ windows_hostname.stdout | trim }}"
+            selected_kbs: "{{ selected_kb_list }}"
+            os_details: "{{ os_details.output | default([]) }}"
+            hotfix_results: "{{ hotfix_results.output | default([]) }}"
+            remaining_selected_updates: "{{ remaining_updates.found_update_count }}"
+            reboot_check: "{{ reboot_check.output | default([]) }}"
+            status: "PASSED_PENDING_REBOOT_REVIEW"
+            timestamp: "{{ now(utc=true).isoformat() }}"
+        per_host: false
+
+    - name: Display verification summary
+      ansible.builtin.debug:
+        msg:
+          server: "{{ inventory_hostname }}"
+          selected_kbs: "{{ selected_kb_list }}"
+          remaining_selected_updates: "{{ remaining_updates.found_update_count }}"
+          hotfix_results: "{{ hotfix_results.output | default([]) }}"
+          reboot_check: "{{ reboot_check.output | default([]) }}"
+          status: "No selected updates pending; reboot status requires review"

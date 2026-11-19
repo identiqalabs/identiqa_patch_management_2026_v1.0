@@ -1,0 +1,64 @@
+---
+- name: Linux Patch Post-Installation Verification
+  hosts: all
+  gather_facts: false
+  become: false
+  serial: 10
+
+  vars:
+    selected_packages: []
+    packages_to_verify: "{{ selected_packages.splitlines() if selected_packages is string else selected_packages }}"
+
+  tasks:
+    - name: Require selected packages
+      ansible.builtin.assert:
+        that:
+          - packages_to_verify is sequence
+          - packages_to_verify is not string
+          - packages_to_verify | length > 0
+        fail_msg: "No packages provided for verification."
+
+    - name: Validate package names
+      ansible.builtin.assert:
+        that:
+          - item is string
+          - item is match('^[a-z0-9][a-z0-9+.-]*$')
+        fail_msg: "Invalid package name."
+      loop: "{{ packages_to_verify }}"
+
+    - name: Check installed and candidate versions
+      ansible.builtin.command:
+        argv: "{{ ['apt-cache', 'policy'] + packages_to_verify }}"
+      register: package_policy
+      changed_when: false
+
+    - name: Check pending updates
+      ansible.builtin.command: apt list --upgradable
+      register: pending_updates
+      changed_when: false
+
+    - name: Check reboot requirement
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_flag
+
+    - name: Display verification report
+      ansible.builtin.debug:
+        msg:
+          server: "{{ inventory_hostname }}"
+          selected_packages: "{{ packages_to_verify }}"
+          package_versions: "{{ package_policy.stdout_lines }}"
+          remaining_updates: "{{ pending_updates.stdout_lines | reject('match', '^Listing') | reject('equalto', '') | list }}"
+          reboot_required: "{{ reboot_flag.stat.exists }}"
+
+    - name: Publish AWX verification results
+      ansible.builtin.set_stats:
+        data:
+          patch_verification:
+            server: "{{ inventory_hostname }}"
+            selected_packages: "{{ packages_to_verify }}"
+            package_versions: "{{ package_policy.stdout_lines }}"
+            remaining_updates: "{{ pending_updates.stdout_lines | reject('match', '^Listing') | reject('equalto', '') | list }}"
+            reboot_required: "{{ reboot_flag.stat.exists }}"
+            timestamp: "{{ now(utc=true).isoformat() }}"
+        per_host: false

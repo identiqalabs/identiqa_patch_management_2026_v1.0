@@ -1,0 +1,169 @@
+
+---
+- name: Prepare Linux SSH credentials
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars_files:
+    - linux_credentials.yml
+
+  tasks:
+    - name: Create temporary SSH key directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: awx-linux-backup-keys-
+      register: linux_key_directory
+
+    - name: Write SSH private keys from Vault
+      ansible.builtin.copy:
+        content: "{{ linux_vm_credentials[item].ssh_private_key | trim }}\n"
+        dest: "{{ linux_key_directory.path }}/{{ item }}.pem"
+        mode: "0600"
+      loop: "{{ groups['linux'] }}"
+      no_log: true
+
+    - name: Configure SSH credentials for Linux hosts
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        ansible_user: "{{ linux_vm_credentials[item].username }}"
+        ansible_ssh_private_key_file: "{{ linux_key_directory.path }}/{{ item }}.pem"
+        ansible_become_password: "{{ linux_vm_credentials[item].sudo_password | default('') }}"
+      loop: "{{ groups['linux'] }}"
+      no_log: true
+
+- name: Linux pre-patch backup and restore verification
+  hosts: linux
+  gather_facts: true
+  become: true
+
+  vars:
+    backup_mount: /mnt/linuxbackups
+    smb_credentials_path: /root/.linuxbackup-smb
+    backup_files:
+      - /etc/hostname
+      - /etc/hosts
+      - /etc/fstab
+
+  tasks:
+    - name: Validate SMB configuration
+      ansible.builtin.assert:
+        that:
+          - linux_smb_server is defined
+          - linux_smb_share is defined
+          - linux_smb_username is defined
+          - linux_smb_password is defined
+          - linux_smb_domain is defined
+        fail_msg: "SMB configuration is missing from AWX."
+      no_log: true
+
+    - name: Install SMB utilities
+      ansible.builtin.apt:
+        name: cifs-utils
+        state: present
+        update_cache: true
+
+    - name: Create backup mount directory
+      ansible.builtin.file:
+        path: "{{ backup_mount }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Create protected SMB credentials file
+      ansible.builtin.copy:
+        dest: "{{ smb_credentials_path }}"
+        content: |
+          username={{ linux_smb_username }}
+          password={{ linux_smb_password }}
+          domain={{ linux_smb_domain }}
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Automatically mount Windows SMB backup share
+      ansible.posix.mount:
+        path: "{{ backup_mount }}"
+        src: "//{{ linux_smb_server }}/{{ linux_smb_share }}"
+        fstype: cifs
+        opts: "credentials={{ smb_credentials_path }},vers=3.0"
+        state: mounted
+      no_log: true
+
+    - name: Verify backup destination is mounted
+      ansible.builtin.command:
+        argv:
+          - mountpoint
+          - -q
+          - "{{ backup_mount }}"
+      changed_when: false
+
+    - name: Generate unique backup archive name
+      ansible.builtin.set_fact:
+        backup_archive: "{{ backup_mount }}/{{ inventory_hostname | regex_replace('[^a-zA-Z0-9_.-]', '_') }}-{{ ansible_date_time.iso8601_basic_short }}.tar.gz"
+
+    - name: Create configuration backup
+      ansible.builtin.command:
+        argv: "{{ ['tar', '-czf', backup_archive, '-C', '/', '--'] + (backup_files | map('regex_replace', '^/', '') | list) }}"
+
+    - name: Verify backup archive integrity
+      ansible.builtin.command:
+        argv:
+          - tar
+          - -tzf
+          - "{{ backup_archive }}"
+      changed_when: false
+
+    - name: Create temporary restore directory
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: backup-restore-test
+      register: restore_directory
+
+    - name: Restore and verify backup
+      block:
+        - name: Extract backup into temporary directory
+          ansible.builtin.unarchive:
+            src: "{{ backup_archive }}"
+            dest: "{{ restore_directory.path }}"
+            remote_src: true
+
+        - name: Compare restored files with originals
+          ansible.builtin.command:
+            argv:
+              - cmp
+              - "{{ item }}"
+              - "{{ restore_directory.path }}{{ item }}"
+          loop: "{{ backup_files }}"
+          changed_when: false
+
+        - name: Publish backup verification result
+          ansible.builtin.set_stats:
+            data:
+              linux_backup_verified: true
+              linux_backup_archive: "{{ backup_archive }}"
+
+        - name: Display backup success
+          ansible.builtin.debug:
+            msg: "BACKUP AND RESTORE VERIFIED: {{ backup_archive }}"
+
+      always:
+        - name: Delete temporary restore directory
+          ansible.builtin.file:
+            path: "{{ restore_directory.path }}"
+            state: absent
+
+- name: Clean up temporary SSH credentials
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Remove temporary SSH key directory
+      ansible.builtin.file:
+        path: "{{ linux_key_directory.path }}"
+        state: absent
+      when: linux_key_directory is defined
+      no_log: false

@@ -1,0 +1,47 @@
+---
+- name: Restricted Ubuntu Patch Installation
+  hosts: all
+  become: false
+  gather_facts: false
+  serial: 10
+
+  tasks:
+    - name: Discover pending updates
+      ansible.builtin.command: apt-get -s upgrade
+      register: pending_updates
+      changed_when: false
+
+    - name: Display pending updates
+      ansible.builtin.debug:
+        msg: "{{ pending_updates.stdout_lines | select('match', '^Inst ') | list }}"
+
+    - name: Refresh APT package lists
+      ansible.builtin.command: sudo -n /usr/local/sbin/awx-patch update
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      changed_when: false
+
+    - name: Install available package updates
+      ansible.builtin.command: sudo -n /usr/local/sbin/awx-patch upgrade
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: patch_result
+      changed_when: "'0 upgraded, 0 newly installed' not in patch_result.stdout"
+
+    - name: Check if reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_flag
+
+    - name: Verify remaining updates
+      ansible.builtin.command: apt-get -s upgrade
+      register: remaining_updates
+      changed_when: false
+
+    - name: Display patch summary
+      ansible.builtin.debug:
+        msg:
+          server: "{{ inventory_hostname }}"
+          patch_task_changed: "{{ patch_result.changed }}"
+          reboot_required: "{{ reboot_flag.stat.exists }}"
+          remaining_updates: "{{ remaining_updates.stdout_lines | select('match', '^Inst ') | list }}"

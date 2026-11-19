@@ -1,0 +1,140 @@
+---
+- name: Infrastructure-aware pre-patch backup automation
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # Default to VMware to preserve existing behavior.
+    infrastructure_provider: "{{ target_infrastructure_provider | default('vmware', true) }}"
+
+    patch_cycle_id: >-
+      {{
+        tower_workflow_job_id
+        | default(awx_workflow_job_id | default('unknown'), true)
+        | string
+      }}
+
+    protected_host: "{{ target_server_ip | default('192.168.156.133', true) }}"
+    vmware_host: "{{ target_vmware_host | default('172.17.99.161', true) }}"
+    vmware_user: "{{ target_vmware_user | default('shivamgargidentiqal', true) }}"
+
+    ssh_key: >-
+      {{
+        ansible_ssh_private_key_file
+        | default(lookup('env', 'ANSIBLE_PRIVATE_KEY_FILE'), true)
+      }}
+
+  tasks:
+
+    - name: Validate supported infrastructure provider
+      ansible.builtin.assert:
+        that:
+          - infrastructure_provider == 'vmware'
+        fail_msg: >-
+          Backup provider '{{ infrastructure_provider }}' is not implemented.
+          Only VMware is currently supported. Patching blocked.
+
+    - name: Display AWX workflow identifiers
+      ansible.builtin.debug:
+        msg:
+          infrastructure_provider: "{{ infrastructure_provider }}"
+          tower_workflow_job_id: "{{ tower_workflow_job_id | default('NOT SET') }}"
+          awx_workflow_job_id: "{{ awx_workflow_job_id | default('NOT SET') }}"
+          awx_job_id: "{{ awx_job_id | default('NOT SET') }}"
+          resolved_patch_cycle_id: "{{ patch_cycle_id }}"
+
+    - name: Validate workflow discovery evidence
+      ansible.builtin.assert:
+        that:
+          - discovered_windows_hostname is defined
+          - discovered_windows_host_ip is defined
+          - discovered_windows_host_ip == protected_host
+          - discovered_windows_hostname is match('^[A-Za-z0-9-]{1,63}$')
+          - patch_cycle_id != 'unknown'
+        fail_msg: "Windows discovery evidence missing or invalid. Snapshot creation blocked."
+
+    - name: Create SSH directory
+      ansible.builtin.file:
+        path: "{{ lookup('env', 'HOME') }}/.ssh"
+        state: directory
+        mode: "0700"
+
+    - name: Configure trusted SSH host key
+      ansible.builtin.known_hosts:
+        name: "{{ vmware_host }}"
+        key: "172.17.99.161 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIETRERsyEManulS8o189e43pHlSYNs1qpmg3abqePyvt"
+
+    - name: Create pre-patch snapshot
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - StrictHostKeyChecking=yes
+          - -i
+          - "{{ ssh_key }}"
+          - "{{ vmware_user }}@{{ vmware_host }}"
+          - "create {{ patch_cycle_id }} {{ discovered_windows_hostname }}"
+      register: snapshot_result
+      changed_when: "'CREATED:' in snapshot_result.stdout"
+
+    - name: Extract snapshot name
+      ansible.builtin.set_fact:
+        snapshot_name: >-
+          {{
+            snapshot_result.stdout
+            | regex_findall('(?:CREATED|REUSED): (Windows-[A-Za-z0-9-]+-[0-9]{8}-[0-9]{6}-IST)')
+            | first
+          }}
+
+    - name: Verify pre-patch snapshot
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - StrictHostKeyChecking=yes
+          - -i
+          - "{{ ssh_key }}"
+          - "{{ vmware_user }}@{{ vmware_host }}"
+          - "verify {{ snapshot_name }}"
+      register: verification_result
+      changed_when: false
+
+    - name: Confirm snapshot readiness
+      ansible.builtin.assert:
+        that:
+          - "'Snapshot verified:' in verification_result.stdout"
+          - "snapshot_name in verification_result.stdout"
+          - snapshot_name is match('^Windows-' ~ (discovered_windows_hostname | regex_escape) ~ '-[0-9]{8}-[0-9]{6}-IST$')
+        fail_msg: "Snapshot verification failed. Patching must not proceed."
+
+    - name: Display snapshot details
+      ansible.builtin.debug:
+        msg:
+          infrastructure_provider: "{{ infrastructure_provider }}"
+          server: "{{ protected_host }}"
+          hostname: "{{ discovered_windows_hostname }}"
+          snapshot: "{{ snapshot_name }}"
+          patch_cycle_id: "{{ patch_cycle_id }}"
+          status: "Pre-patch snapshot verified"
+
+    - name: Publish verified snapshot details to AWX workflow
+      ansible.builtin.set_stats:
+        data:
+          snapshot_verified: true
+          verified_snapshot_name: "{{ snapshot_name }}"
+          verified_snapshot_host: "{{ protected_host }}"
+          verified_patch_cycle_id: "{{ patch_cycle_id }}"
+          
+          # New infrastructure-independent fields
+          backup_verified: true
+          backup_provider: "{{ infrastructure_provider }}"
+          verified_backup_id: "{{ snapshot_name }}"
+          verified_backup_host: "{{ protected_host }}"
+          verified_backup_cycle_id: "{{ patch_cycle_id }}"
+          backup_type: "vm_snapshot"
+        per_host: false

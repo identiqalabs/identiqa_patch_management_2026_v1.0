@@ -1,0 +1,321 @@
+---
+- name: Windows configuration backup
+  hosts: windows
+  gather_facts: false
+  serial: 1
+
+  vars_files:
+    - windows_credentials.yml
+
+  vars:
+    ansible_connection: winrm
+    ansible_port: 5985
+    ansible_winrm_transport: ntlm
+
+    ansible_user: "{{ windows_vm_credentials[inventory_hostname].username }}"
+    ansible_password: "{{ windows_vm_credentials[inventory_hostname].password }}"
+
+    backup_candidates:
+      - '\\192.168.1.118\WindowsBackups'
+      - '\\192.168.156.1\WindowsBackups'
+
+    # If target_backup_destination is provided, use only that; otherwise use the candidate list
+    effective_backup_destinations: >-
+      {{ [target_backup_destination | trim]
+         if (target_backup_destination | default('') | trim | length > 0)
+         else backup_candidates }}
+
+    backup_cycle_id: "{{ (tower_workflow_job_id | default(awx_workflow_job_id | default(''), true)) | string }}"
+
+  tasks:
+
+    - name: Validate backup configuration
+      ansible.builtin.assert:
+        that:
+          - effective_backup_destinations | length > 0
+          - backup_share_username is defined
+          - backup_share_password is defined
+          - backup_share_username | length > 0
+          - backup_share_password | length > 0
+      no_log: false
+
+    - name: Check Windows connectivity
+      ansible.windows.win_ping:
+
+    - name: Get actual Windows hostname
+      ansible.windows.win_command: hostname
+      register: windows_hostname
+      changed_when: false
+
+    - name: Collect Windows configuration and store the archive on an accessible destination
+      ansible.windows.win_powershell:
+        parameters:
+          Destinations: "{{ effective_backup_destinations }}"
+          Machine: "{{ windows_hostname.stdout | trim }}"
+          Username: "{{ backup_share_username }}"
+          CycleId: "{{ backup_cycle_id }}"
+
+        sensitive_parameters:
+          - name: Password
+            value: "{{ backup_share_password }}"
+
+        script: |
+          param(
+            [string[]]$Destinations,
+            [string]$Machine,
+            [string]$Username,
+            [string]$CycleId,
+            [SecureString]$Password
+          )
+
+          $ErrorActionPreference = 'Stop'
+
+          $credential = [PSCredential]::new($Username, $Password)
+
+          $errors   = @()
+          $warnings = [System.Collections.Generic.List[string]]::new()
+          $completed = $false
+          $zipReady  = $false
+
+          $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+          $work = Join-Path $env:TEMP ("awx-config-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+          $zip  = "$work.zip"
+
+          # Run one export; a failure is recorded as a warning and does not stop the backup
+          function Invoke-Export([string]$Name, [scriptblock]$Action) {
+            try { & $Action }
+            catch { $warnings.Add("${Name}: $($_.Exception.Message)") }
+          }
+
+          try {
+
+            # ---------- Collect configuration ----------
+            $stage = 'collect'
+
+            foreach ($d in 'registry','tasks','network','system','security') {
+              New-Item -ItemType Directory -Path "$work\$d" -Force | Out-Null
+            }
+
+            # System information
+            Invoke-Export 'systeminfo' { systeminfo.exe | Out-File "$work\system\systeminfo.txt" -Encoding utf8 }
+            Invoke-Export 'hotfixes'   { Get-HotFix | Select-Object HotFixID, Description, InstalledOn | Export-Csv "$work\system\hotfixes.csv" -NoTypeInformation }
+            Invoke-Export 'installed software' {
+              Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                               'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+                Where-Object DisplayName |
+                Select-Object DisplayName, DisplayVersion, Publisher |
+                Export-Csv "$work\system\installed-software.csv" -NoTypeInformation
+            }
+            Invoke-Export 'services' { Get-CimInstance Win32_Service | Select-Object Name, DisplayName, StartMode, StartName, PathName, State | Export-Csv "$work\system\services.csv" -NoTypeInformation }
+            Invoke-Export 'smb shares' { Get-SmbShare | Select-Object Name, Path, Description | Export-Csv "$work\system\smb-shares.csv" -NoTypeInformation }
+            Invoke-Export 'hosts file' { Copy-Item "$env:SystemRoot\System32\drivers\etc\hosts" "$work\system\hosts" -Force }
+
+            # Network
+            Invoke-Export 'ip addresses' { Get-NetIPAddress | Select-Object InterfaceAlias, AddressFamily, IPAddress, PrefixLength | Export-Csv "$work\network\ip-addresses.csv" -NoTypeInformation }
+            Invoke-Export 'routes'       { Get-NetRoute | Select-Object InterfaceAlias, DestinationPrefix, NextHop, RouteMetric | Export-Csv "$work\network\routes.csv" -NoTypeInformation }
+            Invoke-Export 'dns servers'  { Get-DnsClientServerAddress | Select-Object InterfaceAlias, AddressFamily, ServerAddresses | Export-Csv "$work\network\dns.csv" -NoTypeInformation }
+
+            # Firewall (restorable with: netsh advfirewall import)
+            Invoke-Export 'firewall' {
+              & netsh.exe advfirewall export "$work\security\firewall.wfw" | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "netsh exit code $LASTEXITCODE" }
+            }
+
+            # Local users and groups (account definitions only; password hashes are not captured)
+            Invoke-Export 'local users'  { Get-LocalUser | Select-Object Name, Enabled, Description | Export-Csv "$work\security\local-users.csv" -NoTypeInformation }
+            Invoke-Export 'local groups' {
+              Get-LocalGroup | ForEach-Object {
+                $g = $_.Name
+                Get-LocalGroupMember -Group $g -ErrorAction SilentlyContinue |
+                  Select-Object @{n='Group';e={$g}}, Name, ObjectClass
+              } | Export-Csv "$work\security\local-group-members.csv" -NoTypeInformation
+            }
+
+            # Non-Microsoft scheduled tasks (restorable with: Register-ScheduledTask -Xml)
+            Invoke-Export 'scheduled tasks' {
+              Get-ScheduledTask | Where-Object { $_.TaskPath -notlike '\Microsoft\*' } | ForEach-Object {
+                $n = ($_.TaskPath + $_.TaskName) -replace '[\\/:*?"<>|]', '_'
+                Export-ScheduledTask -TaskName $_.TaskName -TaskPath $_.TaskPath |
+                  Out-File "$work\tasks\$n.xml" -Encoding unicode
+              }
+            }
+
+            # Selected registry keys (restorable with: reg import)
+            $regKeys = [ordered]@{
+              'services'    = 'HKLM\SYSTEM\CurrentControlSet\Services'
+              'policies'    = 'HKLM\SOFTWARE\Policies'
+              'environment' = 'HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+              'run-hklm'    = 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
+            }
+            foreach ($k in $regKeys.GetEnumerator()) {
+              Invoke-Export "registry $($k.Key)" {
+                & reg.exe export $k.Value "$work\registry\$($k.Key).reg" /y | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "reg export exit code $LASTEXITCODE" }
+              }
+            }
+
+            # Boot configuration (restorable with: bcdedit /import)
+            Invoke-Export 'bcd' {
+              & bcdedit.exe /export "$work\system\bcd-store.bak" | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "bcdedit exit code $LASTEXITCODE" }
+            }
+
+            # Metadata
+            @(
+              "Hostname: $Machine"
+              "Timestamp: $(Get-Date -Format o)"
+              "Workflow: $CycleId"
+              "BackupType: Windows configuration export"
+            ) | Out-File "$work\backup-info.txt" -Encoding utf8
+
+            $itemCount = (Get-ChildItem $work -Recurse -File | Measure-Object).Count
+            if ($itemCount -lt 5) {
+              throw "Only $itemCount files were collected; configuration export looks incomplete."
+            }
+
+            # ---------- Compress ----------
+            $stage = 'compress'
+            Compress-Archive -Path "$work\*" -DestinationPath $zip -Force
+
+            $localItem = Get-Item -LiteralPath $zip -ErrorAction Stop
+            if ($localItem.Length -le 0) { throw "Archive is empty." }
+            $localHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+
+            $zipReady = $true
+          }
+          catch {
+            $errors += "local [$stage]: $($_.Exception.Message)"
+          }
+
+          # ---------- Copy to the first reachable destination ----------
+          if ($zipReady) {
+
+            foreach ($destination in $Destinations) {
+
+              $drive = $null
+              $stage = 'connect'
+
+              try {
+
+                # Authenticate against SMB share
+                $drive = New-PSDrive `
+                  -Name AWXBackup `
+                  -PSProvider FileSystem `
+                  -Root $destination `
+                  -Credential $credential `
+                  -ErrorAction Stop
+
+                $stage = 'create directory'
+                $folder = "$destination\AWX-ConfigBackups\$Machine"
+                [System.IO.Directory]::CreateDirectory($folder) | Out-Null
+
+                $stage = 'copy file'
+                $uniqueId = [guid]::NewGuid().ToString('N').Substring(0,8)
+                $file = "$folder\config-$Machine-$timestamp-$uniqueId.zip"
+                Copy-Item -LiteralPath $zip -Destination $file -Force
+
+                # Verify the copy
+                $stage = 'verify file'
+                $item = Get-Item -LiteralPath $file -ErrorAction Stop
+
+                if ($item.Length -ne $localItem.Length) {
+                  throw "Size mismatch: local $($localItem.Length) bytes, share $($item.Length) bytes."
+                }
+
+                $remoteHash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+                if ($remoteHash -ne $localHash) {
+                  throw "SHA256 mismatch between local archive and share copy."
+                }
+
+                $Ansible.Result = @{
+                  verified = $true
+                  destination = $destination
+                  folder = "AWX-ConfigBackups\$Machine"
+                  file = $item.Name
+                  size_bytes = $item.Length
+                  sha256 = $remoteHash
+                  items_collected = $itemCount
+                  warnings = @($warnings)
+                }
+
+                $Ansible.Changed = $true
+                $completed = $true
+
+                break
+              }
+              catch {
+                $errors += "$destination [$stage]: $($_.Exception.Message)"
+              }
+              finally {
+                if ($null -ne $drive) {
+                  Remove-PSDrive -Name AWXBackup -Force -ErrorAction SilentlyContinue
+                }
+              }
+            }
+          }
+
+          # ---------- Clean up local temp files ----------
+          Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $zip  -Force -ErrorAction SilentlyContinue
+
+          if (-not $completed) {
+            $Ansible.Result = @{
+              verified = $false
+              errors = $errors
+            }
+            $Ansible.Changed = $false
+          }
+
+      register: backup_result
+      no_log: false
+
+    - name: Show backup destination failures
+      ansible.builtin.debug:
+        msg: "{{ backup_result.result.errors | default([]) }}"
+      when: not (backup_result.result.verified | default(false) | bool)
+
+    - name: Show non-fatal export warnings
+      ansible.builtin.debug:
+        msg: "{{ backup_result.result.warnings }}"
+      when:
+        - backup_result.result.verified | default(false) | bool
+        - backup_result.result.warnings | default([]) | length > 0
+
+    - name: Require verified configuration backup
+      ansible.builtin.assert:
+        that:
+          - backup_result.result.verified | default(false) | bool
+          - backup_result.result.size_bytes | default(0) | int > 0
+        fail_msg: "Configuration backup or SMB write/verify failed; review the diagnostics above."
+
+    - name: Publish backup evidence to AWX
+      ansible.builtin.set_stats:
+        data:
+          backup_verified: false
+          backup_test_verified: true
+          backup_provider: physical_windows
+          backup_type: config_export
+
+          verified_backup_host: "{{ ansible_host | default(inventory_hostname) }}"
+          verified_backup_hostname: "{{ windows_hostname.stdout | trim }}"
+          verified_backup_id: "{{ backup_result.result.file }}"
+          verified_backup_sha256: "{{ backup_result.result.sha256 }}"
+          verified_backup_cycle_id: "{{ backup_cycle_id }}"
+          verified_backup_destination: "{{ backup_result.result.destination }}"
+
+          patch_installation_permitted: false
+        per_host: false
+
+    - name: Display backup summary
+      ansible.builtin.debug:
+        msg:
+          server: "{{ inventory_hostname }}"
+          windows_hostname: "{{ windows_hostname.stdout | trim }}"
+          selected_destination: "{{ backup_result.result.destination }}"
+          backup_folder: "{{ backup_result.result.folder }}"
+          backup_file: "{{ backup_result.result.file }}"
+          size_bytes: "{{ backup_result.result.size_bytes }}"
+          sha256: "{{ backup_result.result.sha256 }}"
+          items_collected: "{{ backup_result.result.items_collected }}"
+          status: "Configuration backup created and verified"
+          recovery_ready: false
